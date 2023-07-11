@@ -8,7 +8,10 @@
 
 package main
 
-import "container/list"
+import (
+	"container/list"
+	"sync"
+)
 
 // CacheSize determines how big the cache can grow
 const CacheSize = 100
@@ -16,7 +19,7 @@ const CacheSize = 100
 // KeyStoreCacheLoader is an interface for the KeyStoreCache
 type KeyStoreCacheLoader interface {
 	// Load implements a function where the cache should gets it's content from
-	Load(string) string
+	Load(string, chan string)
 }
 
 type page struct {
@@ -26,27 +29,32 @@ type page struct {
 
 // KeyStoreCache is a LRU cache for string key-value pairs
 type KeyStoreCache struct {
-	cache map[string]*list.Element
-	pages list.List
-	load  func(string) string
+	cache  map[string]*list.Element
+	pages  list.List
+	loader KeyStoreCacheLoader
+	locker sync.Mutex
 }
 
 // New creates a new KeyStoreCache
 func New(load KeyStoreCacheLoader) *KeyStoreCache {
 	return &KeyStoreCache{
-		load:  load.Load,
-		cache: make(map[string]*list.Element),
+		loader: load,
+		cache:  make(map[string]*list.Element),
 	}
 }
 
 // Get gets the key from cache, loads it from the source if needed
 func (k *KeyStoreCache) Get(key string) string {
+	k.locker.Lock()
+	defer k.locker.Unlock()
 	if e, ok := k.cache[key]; ok {
 		k.pages.MoveToFront(e)
 		return e.Value.(page).Value
 	}
+
 	// Miss - load from database and save it in cache
-	p := page{key, k.load(key)}
+	loadedKey := make(chan string)
+	go k.loader.Load(key, loadedKey)
 	// if cache is full remove the least used item
 	if len(k.cache) >= CacheSize {
 		end := k.pages.Back()
@@ -55,6 +63,7 @@ func (k *KeyStoreCache) Get(key string) string {
 		// remove from list
 		k.pages.Remove(end)
 	}
+	p := page{key, <-loadedKey}
 	k.pages.PushFront(p)
 	k.cache[key] = k.pages.Front()
 	return p.Value
@@ -66,13 +75,13 @@ type Loader struct {
 }
 
 // Load gets the data from the database
-func (l *Loader) Load(key string) string {
+func (l *Loader) Load(key string, c chan string) {
 	val, err := l.DB.Get(key)
 	if err != nil {
 		panic(err)
 	}
 
-	return val
+	c <- val
 }
 
 func run() *KeyStoreCache {
